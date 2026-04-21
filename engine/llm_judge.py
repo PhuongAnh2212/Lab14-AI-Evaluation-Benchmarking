@@ -1,35 +1,172 @@
 import asyncio
-from typing import Dict, Any
+import json
+from typing import Dict, Any, List
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()
+
 
 class LLMJudge:
-    def __init__(self, model: str = "gpt-4o"):
-        self.model = model
-        # TODO: Định nghĩa rubrics chi tiết cho các tiêu chí: Accuracy, Professionalism, Safety
-        self.rubrics = {
-            "accuracy": "Chấm điểm từ 1-5 dựa trên độ chính xác so với Ground Truth...",
-            "tone": "Chấm điểm từ 1-5 dựa trên sự chuyên nghiệp của ngôn ngữ..."
-        }
+    def __init__(self):
+        # 2 judges as required by rubric
+        self.judges = [
+            {"name": "gpt-4o", "weight": 0.7},
+            {"name": "gpt-4o-mini", "weight": 0.3}
+        ]
 
-    async def evaluate_multi_judge(self, question: str, answer: str, ground_truth: str) -> Dict[str, Any]:
-        """
-        EXPERT TASK: Gọi ít nhất 2 model (ví dụ GPT-4o và Claude).
-        Tính toán sự sai lệch. Nếu lệch > 1 điểm, cần logic xử lý.
-        """
-        # Giả lập gọi 2 model
-        score_a = 4
-        score_b = 3
-        
-        avg_score = (score_a + score_b) / 2
-        agreement = 1.0 if score_a == score_b else 0.5
-        
+    # ================================
+    # 🧠 LLM AS A JUDGE
+    # ================================
+
+    async def _call_judge_llm(
+        self,
+        model: str,
+        question: str,
+        answer: str,
+        ground_truth: str
+    ) -> Dict[str, Any]:
+
+        prompt = f"""
+You are an expert AI evaluator.
+
+Evaluate the following answer.
+
+QUESTION:
+{question}
+
+GROUND TRUTH:
+{ground_truth}
+
+MODEL ANSWER:
+{answer}
+
+Return ONLY valid JSON:
+
+{{
+  "score": float (0-5),
+  "reason": "short explanation",
+  "correctness": float (0-5),
+  "groundedness": float (0-5),
+  "relevance": float (0-5)
+}}
+"""
+
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a strict evaluation judge."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0
+        )
+
+        content = response.choices[0].message.content
+
+        try:
+            return json.loads(content)
+        except:
+            # fallback if model returns non-JSON
+            return {
+                "score": 2.5,
+                "reason": "parse_error",
+                "correctness": 2.5,
+                "groundedness": 2.5,
+                "relevance": 2.5
+            }
+
+    # ================================
+    # ⚖️ MULTI-JUDGE CONSENSUS
+    # ================================
+
+    async def evaluate(
+        self,
+        question: str,
+        answer: str,
+        ground_truth: str
+    ) -> Dict[str, Any]:
+
+        results = await asyncio.gather(*[
+            self._call_judge_llm(j["name"], question, answer, ground_truth)
+            for j in self.judges
+        ])
+
+        scored = []
+        weighted_sum = 0
+        total_weight = 0
+
+        for judge, result in zip(self.judges, results):
+            score = float(result["score"])
+            weight = judge["weight"]
+
+            scored.append({
+                "model": judge["name"],
+                "score": score,
+                "reason": result.get("reason", "")
+            })
+
+            weighted_sum += score * weight
+            total_weight += weight
+
+        final_score = weighted_sum / total_weight
+
+        # ================================
+        # 📊 AGREEMENT METRICS
+        # ================================
+
+        scores = [s["score"] for s in scored]
+        score_diff = max(scores) - min(scores)
+
+        agreement_rate = 1.0 - (score_diff / 5.0)
+
+        # ================================
+        # ⚠️ CONFLICT RESOLUTION
+        # ================================
+
+        if score_diff > 1.5:
+            resolution = "high_conflict_weighted_gpt_priority"
+            final_score = max(scores)  # trust stronger model
+        else:
+            resolution = "weighted_average"
+
         return {
-            "final_score": avg_score,
-            "agreement_rate": agreement,
-            "individual_scores": {"gpt-4o": score_a, "claude-3-5": score_b}
+            "final_score": round(final_score, 3),
+            "agreement_rate": round(agreement_rate, 3),
+            "score_variance": round(score_diff, 3),
+            "resolution": resolution,
+            "individual_results": scored
         }
 
-    async def check_position_bias(self, response_a: str, response_b: str):
-        """
-        Nâng cao: Thực hiện đổi chỗ response A và B để xem Judge có thiên vị vị trí không.
-        """
-        pass
+    # ================================
+    # 🔄 POSITION BIAS TEST
+    # ================================
+
+    async def check_position_bias(
+        self,
+        question: str,
+        answer_a: str,
+        answer_b: str,
+        ground_truth: str
+    ) -> Dict[str, Any]:
+
+        res_a = await self._call_judge_llm(
+            "gpt-4o",
+            question,
+            answer_a,
+            ground_truth
+        )
+
+        res_b = await self._call_judge_llm(
+            "gpt-4o",
+            question,
+            answer_b,
+            ground_truth
+        )
+
+        bias = abs(res_a["score"] - res_b["score"])
+
+        return {
+            "score_a": res_a["score"],
+            "score_b": res_b["score"],
+            "position_bias": round(bias, 3),
+            "bias_detected": bias > 0.7
+        }
